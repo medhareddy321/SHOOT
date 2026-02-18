@@ -2,6 +2,7 @@
 
 import { useMemo, useState, useTransition } from 'react';
 import Link from 'next/link';
+import { Search, Bookmark, Target, MoreVertical } from 'lucide-react';
 import { savePhotoRemote } from '@/lib/storage';
 import { POSE_TEMPLATES, type PoseTemplate } from '@/lib/poses';
 
@@ -12,19 +13,23 @@ export default function BrowsePage() {
   const [detail, setDetail] = useState<DetailState>({ open: false, pose: null });
   const [saving, startSaving] = useTransition();
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [activeOverlayId, setActiveOverlayId] = useState<string | null>(null);
+  const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
 
   const categories = useMemo(
     () => ['All', ...Array.from(new Set(POSE_TEMPLATES.map((p) => p.category)))],
     []
   );
 
-  const filteredPoses = useMemo(
-    () =>
-      activeCategory === 'All'
-        ? POSE_TEMPLATES
-        : POSE_TEMPLATES.filter((p) => p.category === activeCategory),
-    [activeCategory]
-  );
+  const filteredPoses = useMemo(() => {
+    const bySearch = POSE_TEMPLATES.filter((p) =>
+      p.name.toLowerCase().includes(searchTerm.toLowerCase())
+    );
+    return activeCategory === 'All'
+      ? bySearch
+      : bySearch.filter((p) => p.category === activeCategory);
+  }, [activeCategory, searchTerm]);
 
   const recommended = POSE_TEMPLATES.slice(0, 6);
 
@@ -37,7 +42,12 @@ export default function BrowsePage() {
           photoDataUrl: pose.imageUrl,
           score: 0,
         });
-        setSaveMessage('Saved to gallery');
+        setSavedIds((prev) => {
+          const next = new Set(prev);
+          next.add(pose.id);
+          return next;
+        });
+        setSaveMessage('Saved!');
       } catch {
         setSaveMessage('Save failed — log in?');
       }
@@ -47,8 +57,21 @@ export default function BrowsePage() {
 
   return (
     <div className="min-h-screen bg-black text-white pb-24">
+      {/* Search */}
+      <div className="sticky top-0 z-30 bg-black/95 backdrop-blur-md px-4 pt-3 pb-2">
+        <div className="flex items-center gap-3 px-5 py-3 rounded-full bg-[#1f1f1f] border border-white/10">
+          <Search size={20} className="text-gray-400" />
+          <input
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            placeholder="Search poses..."
+            className="w-full bg-transparent text-white placeholder-gray-500 focus:outline-none"
+          />
+        </div>
+      </div>
+
       {/* Hero */}
-      <header className="sticky top-0 z-20 bg-black/95 backdrop-blur-md border-b border-white/10 px-4 pt-4 pb-3">
+      <header className="sticky top-[70px] z-20 bg-black/95 backdrop-blur-md border-b border-white/10 px-4 pt-3 pb-3">
         <div className="flex items-center justify-between">
           <div>
             <p className="text-xs uppercase tracking-[0.18em] text-white/50">Shoot</p>
@@ -107,41 +130,63 @@ export default function BrowsePage() {
       {/* Featured vertical cards (mobile first) */}
       <section className="px-4 py-3 grid grid-cols-2 gap-3">
         {filteredPoses.map((pose) => (
-          <button
+          <div
             key={pose.id}
-            onClick={() => setDetail({ open: true, pose })}
-            className="text-left rounded-2xl overflow-hidden bg-white/5 border border-white/10 hover:border-white/30 transition-colors shadow-lg"
+            className="group relative rounded-2xl overflow-hidden bg-[#1a1a1a] border border-white/10 shadow-lg"
+            onMouseLeave={() => setActiveOverlayId(null)}
+            onClick={() => setActiveOverlayId(activeOverlayId === pose.id ? null : pose.id)}
           >
             <div className="relative aspect-[2/3] overflow-hidden">
-              <div className="w-full h-full">
-                <div className="relative w-full h-full" style={{ aspectRatio: '2 / 3' }}>
-                  <div className="absolute inset-0">
-                    <img
-                      src={pose.imageUrl}
-                      alt={pose.name}
-                      className="w-full h-full object-cover object-center"
-                      style={{ aspectRatio: '2 / 3' }}
-                    />
-                  </div>
+              <img
+                src={pose.imageUrl}
+                alt={pose.name}
+                className="w-full h-full object-cover object-center"
+                style={{ aspectRatio: '2 / 3' }}
+              />
+              <div
+                className={`absolute inset-0 bg-black/50 flex flex-col justify-between p-3 transition-opacity duration-200 ${
+                  activeOverlayId === pose.id ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                }`}
+              >
+                <div className="flex items-center justify-between text-white">
+                  <MoreVertical size={18} />
+                  <button
+                    className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-white/15 text-white text-xs font-semibold"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleSave(pose);
+                      setActiveOverlayId(null);
+                    }}
+                  >
+                    <Bookmark size={18} fill={savedIds.has(pose.id) ? 'white' : 'none'} />
+                    {savedIds.has(pose.id) ? 'Saved' : 'Save'}
+                  </button>
+                </div>
+                <div className="flex items-center justify-end gap-2 text-white">
+                  <button
+                    className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-white text-black text-xs font-semibold"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (typeof window !== 'undefined') {
+                        sessionStorage.setItem(
+                          'selectedPose',
+                          JSON.stringify({
+                            id: pose.id,
+                            name: pose.name,
+                            imageUrl: pose.imageUrl,
+                          })
+                        );
+                        window.location.href = '/camera';
+                      }
+                    }}
+                  >
+                    <Target size={18} />
+                    Shoot
+                  </button>
                 </div>
               </div>
-              <div className="absolute bottom-0 inset-x-0 p-3 bg-gradient-to-t from-black/70 to-transparent">
-                <p className="text-xs text-white/60">{pose.category}</p>
-                <p className="text-sm font-semibold">{pose.name}</p>
-                <span
-                  className={`mt-1 inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium ${
-                    pose.difficulty === 'easy'
-                      ? 'bg-green-500/30 text-green-100'
-                      : pose.difficulty === 'medium'
-                      ? 'bg-amber-500/30 text-amber-100'
-                      : 'bg-red-500/30 text-red-100'
-                  }`}
-                >
-                  {pose.difficulty}
-                </span>
-              </div>
             </div>
-          </button>
+          </div>
         ))}
       </section>
 
@@ -172,7 +217,21 @@ export default function BrowsePage() {
                 {saving ? 'Saving…' : 'Save'}
               </button>
               <Link
-                href={`/camera?poseId=${detail.pose.id}`}
+                href="/camera"
+                onClick={(e) => {
+                  e.preventDefault();
+                  if (typeof window !== 'undefined') {
+                    sessionStorage.setItem(
+                      'selectedPose',
+                      JSON.stringify({
+                        id: detail.pose!.id,
+                        name: detail.pose!.name,
+                        imageUrl: detail.pose!.imageUrl,
+                      })
+                    );
+                    window.location.href = '/camera';
+                  }
+                }}
                 className="w-full text-center py-3 rounded-xl bg-white text-black font-semibold text-sm"
               >
                 Shoot
@@ -188,6 +247,13 @@ export default function BrowsePage() {
               Close
             </button>
           </div>
+        </div>
+      )}
+      {saveMessage && (
+        <div className="fixed bottom-20 inset-x-0 z-50 flex justify-center pointer-events-none">
+          <span className="px-4 py-2 rounded-full bg-green-600 text-white text-sm shadow-lg">
+            {saveMessage}
+          </span>
         </div>
       )}
     </div>

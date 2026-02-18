@@ -68,12 +68,23 @@ export default function SavedPage() {
                   >
                     Delete
                   </button>
-                  <Link
-                    href={`/camera?savedId=${photo.id}`}
+                  <button
+                    onClick={() => {
+                      if (typeof window !== 'undefined') {
+                        sessionStorage.setItem(
+                          'selectedPose',
+                          JSON.stringify({
+                            name: photo.poseName,
+                            imageUrl: photo.photoDataUrl,
+                          })
+                        );
+                        window.location.href = '/camera';
+                      }
+                    }}
                     className="text-white font-semibold hover:underline"
                   >
                     Shoot
-                  </Link>
+                  </button>
                 </div>
               </div>
             </div>

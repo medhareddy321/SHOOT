@@ -6,10 +6,9 @@
  */
 
 import { useCallback, useEffect, useRef, useState, Suspense } from 'react';
-import { useSearchParams } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { getPoseById } from '@/lib/poses';
-import { saveGalleryPhoto, fetchSavedPhotoById } from '@/lib/storage';
+import { saveGalleryPhoto } from '@/lib/storage';
 
 // ---- Types (MediaPipe landmarks are normalized 0–1) ----
 type Landmark = { x: number; y: number; z?: number; visibility?: number };
@@ -169,21 +168,40 @@ function CircularMatchProgress({ score, threshold }: { score: number; threshold:
   );
 }
 
+/** Downscale image to max 640 on longest edge, send to pose. */
+async function sendImageToPose(pose: InstanceType<typeof import('@mediapipe/pose').Pose>, img: HTMLImageElement) {
+  const maxSize = 640;
+  const w = img.naturalWidth;
+  const h = img.naturalHeight;
+  const scale = Math.min(1, maxSize / Math.max(w, h));
+  const cw = Math.round(w * scale);
+  const ch = Math.round(h * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = cw;
+  canvas.height = ch;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas context missing');
+  ctx.drawImage(img, 0, 0, w, h, 0, 0, cw, ch);
+  await pose.send({ image: canvas });
+}
+
 type Step = 'upload' | 'camera';
 
 function CameraPageContent() {
-  const searchParams = useSearchParams();
-  const poseIdParam = searchParams.get('poseId');
-  const savedIdParam = searchParams.get('savedId');
+  console.log('=== CAMERA PAGE RENDER ===');
+  const router = useRouter();
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  const [step, setStep] = useState<Step>(() => (poseIdParam || savedIdParam ? 'camera' : 'upload'));
+  const initialStep: Step = 'upload';
+  console.log('Initializing step:', initialStep);
+  const [step, setStep] = useState<Step>(initialStep);
   const [templatePose, setTemplatePose] = useState<PoseLandmarks>(null);
   const [templateImageUrl, setTemplateImageUrl] = useState<string | null>(null);
   const [templateImageSize, setTemplateImageSize] = useState<{ width: number; height: number } | null>(null);
+  const [templateImage, setTemplateImage] = useState<HTMLImageElement | null>(null);
   const [livePose, setLivePose] = useState<PoseLandmarks>(null);
   const [matchScore, setMatchScore] = useState(0);
   const [camError, setCamError] = useState<string | null>(null);
@@ -193,7 +211,6 @@ function CameraPageContent() {
   const [autoCaptureEnabled, setAutoCaptureEnabled] = useState<boolean>(true);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [poseNameOverride, setPoseNameOverride] = useState<string | null>(null);
-  const [poseReady, setPoseReady] = useState(false);
 
   // Auto-capture state
   const [capturedPhoto, setCapturedPhoto] = useState<string | null>(null);
@@ -220,6 +237,69 @@ function CameraPageContent() {
   const previousScoreRef = useRef(0);
   const poseInitializedRef = useRef(false);
 
+  // Start camera with resolution fallback
+  const startCameraWithFallback = useCallback(async () => {
+    if (!videoRef.current) return;
+    const { Camera } = await import('@mediapipe/camera_utils');
+    const resolutions = [
+      { width: 1920, height: 1080 },
+      { width: 1280, height: 720 },
+      { width: 640, height: 480 },
+    ];
+    for (const { width, height } of resolutions) {
+      try {
+        console.log(`Trying to start camera at ${width}x${height}...`);
+        const cam = new Camera(videoRef.current, {
+          onFrame: async () => {
+            if (poseRef.current && videoRef.current) {
+              await poseRef.current.send({ image: videoRef.current });
+            }
+          },
+          width,
+          height,
+          facingMode: 'user',
+        });
+        await cam.start();
+        cameraRef.current = cam;
+        setIsCamActive(true);
+        setCamError(null);
+        console.log(`✅ Camera started successfully at ${width}x${height}`);
+        return;
+      } catch (err) {
+        console.log(`❌ Failed at ${width}x${height}:`, err);
+      }
+    }
+    console.error('❌ Could not start camera at any resolution');
+  }, []);
+
+  // Stop camera during template extraction; restart after.
+  const pauseCameraForTemplate = useCallback(async () => {
+    if (cameraRef.current) {
+      console.log('⏸️ Pausing camera for template extraction');
+      try {
+        await cameraRef.current.stop();
+      } catch (err) {
+        console.warn('Pause camera error:', err);
+      }
+      setIsCamActive(false);
+    }
+  }, []);
+
+  const resumeCameraAfterTemplate = useCallback(async () => {
+    if (step === 'camera') {
+      console.log('▶️ Resuming camera');
+      await startCameraWithFallback();
+    }
+  }, [step, startCameraWithFallback]);
+
+  useEffect(() => {
+    console.log('Initial step state:', step);
+  }, []); // run once on mount
+
+  useEffect(() => {
+    console.log('Step changed to:', step);
+  }, [step]);
+
   /** EMA (alpha=0.2) over raw score for stable display. */
   const getSmoothedScore = useCallback((rawScore: number) => {
     const alpha = 0.2;
@@ -228,10 +308,69 @@ function CameraPageContent() {
     return Math.round(smoothed);
   }, []);
 
+  // Debug: log initial state on mount
+  useEffect(() => {
+    console.log('Camera page mounted, initial step:', step);
+    const selectedPoseData = typeof window !== 'undefined' ? sessionStorage.getItem('selectedPose') : null;
+    if (selectedPoseData && step === 'upload') {
+      const poseData = JSON.parse(selectedPoseData);
+      console.log('🎯 Auto-loading pose from Browse/Saved:', poseData);
+      sessionStorage.removeItem('selectedPose');
+      modeRef.current = 'template';
+      setExtracting(true);
+      setTemplatePose(null);
+      setTemplateImageSize(null);
+      setPoseNameOverride(poseData.name ?? 'Pose');
+      setTemplateImageUrl(poseData.imageUrl ?? null);
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = async () => {
+        try {
+          const maxSize = 640;
+          const scale = Math.min(maxSize / img.width, maxSize / img.height, 1);
+          const cw = Math.floor(img.width * scale);
+          const ch = Math.floor(img.height * scale);
+          console.log('📐 Downscaled from', img.width, 'x', img.height, 'to', cw, 'x', ch);
+          const canvas = document.createElement('canvas');
+          canvas.width = cw;
+          canvas.height = ch;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) throw new Error('No canvas ctx');
+          ctx.drawImage(img, 0, 0, cw, ch);
+          // wait for poseRef ready
+          let attempts = 0;
+          while (!poseRef.current && attempts < 50) {
+            console.log('⏳ Waiting for MediaPipe... attempt', attempts);
+            await new Promise((r) => setTimeout(r, 100));
+            attempts++;
+          }
+          if (!poseRef.current) throw new Error('MediaPipe not ready');
+          setTemplateImageSize({ width: img.naturalWidth, height: img.naturalHeight });
+          setTemplateImage(img);
+          setTemplatePose(null);
+          console.log('🔄 Mode set to: template');
+          await pauseCameraForTemplate();
+          await poseRef.current.send({ image: canvas });
+          console.log('✅ Sent to MediaPipe, waiting for results...');
+          await resumeCameraAfterTemplate();
+        } catch (err) {
+          console.error('❌ Auto-load template failed:', err);
+          setExtracting(false);
+        }
+      };
+      img.onerror = (err) => {
+        console.error('❌ Auto-load image failed:', err);
+        setExtracting(false);
+      };
+      img.src = poseData.imageUrl;
+    }
+  }, [pauseCameraForTemplate, resumeCameraAfterTemplate, step]); // run once
+
   // Init MediaPipe Pose and drawing utils once. Single onResults handler that routes by mode.
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      console.log('Initializing MediaPipe Pose...');
       const { Pose, POSE_CONNECTIONS } = await import('@mediapipe/pose');
       const { drawConnectors, drawLandmarks } = await import('@mediapipe/drawing_utils');
       if (cancelled) return;
@@ -252,9 +391,18 @@ function CameraPageContent() {
         if (cancelled) return;
         const landmarks = results.poseLandmarks ?? null;
         if (modeRef.current === 'template') {
+          console.log('📊 MediaPipe results received, mode: template, landmarks:', !!landmarks);
           setTemplatePose(landmarks ? [...landmarks] : null);
           setExtracting(false);
+          if (landmarks) {
+            console.log('✅ Template pose extracted successfully');
+            modeRef.current = 'live';
+            console.log('🔄 Mode switched to: live');
+          } else {
+            console.error('❌ No landmarks detected in template image');
+          }
         } else {
+          console.log('📊 MediaPipe results received, mode: live, landmarks:', !!landmarks);
           setLivePose(landmarks ? [...landmarks] : null);
         }
       };
@@ -262,7 +410,7 @@ function CameraPageContent() {
       pose.onResults(handleResults);
       poseRef.current = pose;
       poseInitializedRef.current = true;
-      setPoseReady(true);
+      console.log('MediaPipe Pose initialized');
     })();
     return () => {
       cancelled = true;
@@ -271,60 +419,10 @@ function CameraPageContent() {
   }, []);
 
   // Auto-load pose from Browse (poseId) when ready.
-  useEffect(() => {
-    if (!poseIdParam || !poseInitializedRef.current || !poseRef.current) return;
-    const poseTemplate = getPoseById(poseIdParam);
-    if (!poseTemplate) return;
-
-    modeRef.current = 'template';
-    setExtracting(true);
-    setTemplatePose(null);
-    setTemplateImageSize(null);
-    setPoseNameOverride(poseTemplate.name);
-    setTemplateImageUrl(poseTemplate.imageUrl);
-
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = async () => {
-      setTemplateImageSize({ width: img.naturalWidth, height: img.naturalHeight });
-      if (poseRef.current) {
-        await poseRef.current.send({ image: img });
-      }
-    };
-    img.onerror = () => {
-      setExtracting(false);
-    };
-    img.src = poseTemplate.imageUrl;
-  }, [poseIdParam]);
+  // Removed legacy poseId deep-linking
 
   // Auto-load pose from Saved (savedId) when provided.
-  useEffect(() => {
-    if (!savedIdParam || !poseInitializedRef.current || !poseRef.current) return;
-    modeRef.current = 'template';
-    setExtracting(true);
-    setTemplatePose(null);
-    setTemplateImageSize(null);
-    setTemplateImageUrl(null);
-    (async () => {
-      try {
-        const saved = await fetchSavedPhotoById(savedIdParam);
-        if (!saved) throw new Error('Pose not found');
-        setPoseNameOverride(saved.poseName);
-        setTemplateImageUrl(saved.photoDataUrl);
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = async () => {
-          setTemplateImageSize({ width: img.naturalWidth, height: img.naturalHeight });
-          if (poseRef.current) {
-            await poseRef.current.send({ image: img });
-          }
-        };
-        img.src = saved.photoDataUrl;
-      } catch {
-        setExtracting(false);
-      }
-    })();
-  }, [savedIdParam]);
+  // Removed legacy savedId deep-linking
 
   // Draw preview when in upload step with template pose.
   useEffect(() => {
@@ -357,13 +455,7 @@ function CameraPageContent() {
     img.src = templateImageUrl;
   }, [step, templateImageUrl, templatePose, templateImageSize]);
 
-  // Auto-switch to camera step once template pose is extracted when coming from Browse/Saved.
-  useEffect(() => {
-    if ((poseIdParam || savedIdParam) && templatePose?.length) {
-      modeRef.current = 'live';
-      setStep('camera');
-    }
-  }, [step, poseIdParam, savedIdParam, templatePose]);
+  // No auto-switch from deep links; browse/saved now use upload flow via sessionStorage.
 
   // Draw video + ghost template + live skeleton.
   const draw = useCallback(() => {
@@ -497,8 +589,7 @@ function CameraPageContent() {
       setCapturedPhoto(photoDataUrl);
       setLastCaptureType(captureType);
 
-      const poseTemplate = poseIdParam ? getPoseById(poseIdParam) : null;
-      const poseName = poseNameOverride ?? poseTemplate?.name ?? 'Custom Pose';
+      const poseName = poseNameOverride ?? 'Custom Pose';
 
       // Defer saving until user confirms.
       pendingPoseNameRef.current = poseName;
@@ -506,7 +597,7 @@ function CameraPageContent() {
       pendingCaptureTypeRef.current = captureType;
       setShowSuccessModal(true);
     },
-    [matchScore, poseIdParam, poseNameOverride, templateImageSize]
+    [matchScore, poseNameOverride, templateImageSize]
   );
 
   const startCountdown = useCallback(() => {
@@ -558,46 +649,20 @@ function CameraPageContent() {
 
   // Start webcam when entering camera step (works for both deep link and manual).
   useEffect(() => {
-    if (step !== 'camera') return;
-    const video = videoRef.current;
-    if (!video) return;
-    if (!poseReady || !poseRef.current) return;
-
-    let cancelled = false;
-    console.log('Attempting to start camera, step:', step, 'videoRef exists:', Boolean(video));
-    (async () => {
-      const { Camera } = await import('@mediapipe/camera_utils');
-      if (cancelled || !poseRef.current) return;
-
-      try {
-        const camera = new Camera(video, {
-          onFrame: async () => {
-            if (cancelled || !poseRef.current) return;
-            await poseRef.current.send({ image: video });
-          },
-          width: 640,
-          height: 480,
-          facingMode: 'user',
-        });
-        await camera.start();
-        if (cancelled) return;
-        cameraRef.current = camera;
-        setIsCamActive(true);
-        setCamError(null);
-        console.log('Camera started successfully');
-      } catch (err) {
-        setCamError(err instanceof Error ? err.message : 'Camera access failed');
-        console.error('Camera start error', err);
-      }
-    })();
+    console.log('Camera start effect - step:', step, 'videoRef exists:', !!videoRef.current, 'camera already started:', !!cameraRef.current);
+    if (step === 'camera' && videoRef.current && !cameraRef.current) {
+      console.log('ATTEMPTING TO START CAMERA NOW');
+      startCameraWithFallback();
+    } else {
+      console.log('Camera NOT starting - step:', step, 'videoRef:', !!videoRef.current, 'cameraRef:', !!cameraRef.current);
+    }
 
     return () => {
-      cancelled = true;
       try { if (cameraRef.current) cameraRef.current.stop(); } catch { /* ignore */ }
       cameraRef.current = null;
       setIsCamActive(false);
     };
-  }, [step, poseReady]);
+  }, [step, startCameraWithFallback]);
 
   const onFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -614,7 +679,11 @@ function CameraPageContent() {
     img.crossOrigin = 'anonymous';
     img.onload = async () => {
       if (!poseRef.current) return;
-      await poseRef.current.send({ image: img });
+      try {
+        await sendImageToPose(poseRef.current, img);
+      } catch {
+        setExtracting(false);
+      }
     };
     img.src = url;
     e.target.value = '';
@@ -643,11 +712,15 @@ function CameraPageContent() {
   }, [cancelCountdown]);
 
   const handleBack = useCallback(() => {
+    console.log('Back button clicked, current step:', step);
     handleResetCapture();
-    // reinitialize pose for fresh template extraction when coming back
     modeRef.current = 'template';
-    setStep(poseIdParam || savedIdParam ? 'camera' : 'upload');
-  }, [handleResetCapture, poseIdParam, savedIdParam]);
+    if (step === 'camera') {
+      setStep('upload');
+    } else {
+      router.push('/');
+    }
+  }, [handleResetCapture, step, router]);
 
   const handleSaveConfirmed = useCallback(async () => {
     if (!capturedPhoto || !pendingPoseNameRef.current || pendingScoreRef.current === null || !pendingCaptureTypeRef.current) {
@@ -672,7 +745,7 @@ function CameraPageContent() {
   }, [capturedPhoto, handleResetCapture]);
 
   // Determine pose name for display
-  const currentPoseName = poseNameOverride ?? (poseIdParam ? (getPoseById(poseIdParam)?.name ?? 'Pose') : 'Custom Pose');
+  const currentPoseName = poseNameOverride ?? 'Custom Pose';
 
   return (
     <div className="min-h-screen min-h-[100dvh] flex flex-col bg-black text-white">
@@ -685,12 +758,10 @@ function CameraPageContent() {
               </Link>
             </div>
             <h1 className="text-lg font-semibold mt-2">
-              {poseIdParam ? currentPoseName : 'Choose a pose image'}
+              Choose a pose image
             </h1>
             <p className="text-sm text-white/60 mt-0.5">
-              {poseIdParam
-                ? 'Extracting pose from template...'
-                : "We'll extract the body joints, then you can match it with your camera."}
+              We'll extract the body joints, then you can match it with your camera.
             </p>
             <p className="text-xs text-white/40 mt-1">
               All processing happens on-device. Make sure everyone in frame consents before you shoot.
