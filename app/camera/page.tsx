@@ -1,22 +1,23 @@
 'use client';
 
 /**
- * Camera page — upload pose image OR receive poseId from browse page →
- * extract skeleton → match on camera → auto-capture on success → save to gallery.
+ * Camera page — same flow as prodhacks-image-recognition:
+ * upload pose image → extract skeleton → match on camera → Take picture (share/download).
+ * No auto-capture, rear camera default, mobile viewport scaling.
  */
 
 import { useCallback, useEffect, useRef, useState, Suspense } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { saveGalleryPhoto } from '@/lib/storage';
 
 // ---- Types (MediaPipe landmarks are normalized 0–1) ----
 type Landmark = { x: number; y: number; z?: number; visibility?: number };
 type PoseLandmarks = Landmark[] | null;
 
-// ---- Scoring & success ----
+// ---- Scoring & success (same as image-recognition) ----
 const KEY_LANDMARK_INDICES = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26] as const;
 const SUCCESS_THRESHOLD = 83;
+const SUCCESS_HOLD_FRAMES = 4;
 const MIN_VISIBLE_LANDMARKS = 5;
 const CAM_W = 640;
 const CAM_H = 480;
@@ -208,23 +209,10 @@ function CameraPageContent() {
   const [isCamActive, setIsCamActive] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [guidancePrompt, setGuidancePrompt] = useState<string | null>(null);
-  const [autoCaptureEnabled, setAutoCaptureEnabled] = useState<boolean>(true);
-  const [countdown, setCountdown] = useState<number | null>(null);
+  const [displaySuccess, setDisplaySuccess] = useState(false);
   const [poseNameOverride, setPoseNameOverride] = useState<string | null>(null);
 
-  // Auto-capture state
-  const [capturedPhoto, setCapturedPhoto] = useState<string | null>(null);
-  const [showSuccessModal, setShowSuccessModal] = useState(false);
-  const [lastCaptureType, setLastCaptureType] = useState<'auto' | 'manual' | null>(null);
-  const [saveInFlight, setSaveInFlight] = useState(false);
-  const hasCapturedRef = useRef(false);
-  const isCapturingRef = useRef(false);
-  const countdownTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const autoHoldStartRef = useRef<number | null>(null);
-  const pendingPoseNameRef = useRef<string | null>(null);
-  const pendingScoreRef = useRef<number | null>(null);
-  const pendingCaptureTypeRef = useRef<'auto' | 'manual' | null>(null);
-
+  const successHoldCountRef = useRef(0);
   const poseRef = useRef<InstanceType<typeof import('@mediapipe/pose').Pose> | null>(null);
   const modeRef = useRef<'template' | 'live'>('template');
   const cameraRef = useRef<InstanceType<typeof import('@mediapipe/camera_utils').Camera> | null>(null);
@@ -532,113 +520,64 @@ function CameraPageContent() {
     };
   }, [isCamActive, draw]);
 
-  const cancelCountdown = useCallback(() => {
-    if (countdownTimerRef.current) {
-      clearInterval(countdownTimerRef.current);
-      countdownTimerRef.current = null;
-    }
-    setCountdown(null);
+  /** Capture raw video frame (no overlay) — share or download, same as image-recognition. */
+  const capturePhoto = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || video.readyState < 2) return;
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, w, h);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) return;
+        const file = new File([blob], `pose-capture-${Date.now()}.png`, { type: 'image/png' });
+        if (typeof navigator !== 'undefined' && navigator.share && navigator.canShare?.({ files: [file] })) {
+          navigator.share({ files: [file], title: 'Pose capture' }).catch(() => {
+            downloadBlob(blob);
+          });
+        } else {
+          downloadBlob(blob);
+        }
+      },
+      'image/png'
+    );
   }, []);
 
-  const performCapture = useCallback(
-    (captureType: 'auto' | 'manual') => {
-      if (isCapturingRef.current) return;
-      const video = videoRef.current;
-      if (!video || video.videoWidth === 0 || video.videoHeight === 0) return;
+  function downloadBlob(blob: Blob) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `pose-capture-${Date.now()}.png`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
 
-      // Build a clean frame matching the displayed letterbox (no overlays).
-      const Cw = video.videoWidth;
-      const Ch = video.videoHeight;
-      const A_c = Cw / Ch;
-      const size = templateImageSize;
-      const A_t = size ? size.width / size.height : A_c;
-
-      let boxX: number, boxY: number, boxW: number, boxH: number;
-      if (A_t < A_c) {
-        boxH = Ch; boxW = Ch * A_t; boxX = (Cw - boxW) / 2; boxY = 0;
-      } else {
-        boxW = Cw; boxH = Cw / A_t; boxX = 0; boxY = (Ch - boxH) / 2;
-      }
-      const vW = video.videoWidth;
-      const vH = video.videoHeight;
-      const scl = Math.max(boxW / vW, boxH / vH);
-      const sW = boxW / scl;
-      const sH = boxH / scl;
-      const sx = (vW - sW) / 2;
-      const sy = (vH - sH) / 2;
-
-      const temp = document.createElement('canvas');
-      temp.width = Cw;
-      temp.height = Ch;
-      const ctx = temp.getContext('2d');
-      if (!ctx) return;
-
-      ctx.drawImage(video, sx, sy, sW, sH, boxX, boxY, boxW, boxH);
-
-      const photoDataUrl = temp.toDataURL('image/jpeg', 0.9);
-
-      isCapturingRef.current = true;
-      hasCapturedRef.current = true;
-      setCapturedPhoto(photoDataUrl);
-      setLastCaptureType(captureType);
-
-      const poseName = poseNameOverride ?? 'Custom Pose';
-
-      // Defer saving until user confirms.
-      pendingPoseNameRef.current = poseName;
-      pendingScoreRef.current = matchScore;
-      pendingCaptureTypeRef.current = captureType;
-      setShowSuccessModal(true);
-    },
-    [matchScore, poseNameOverride, templateImageSize]
-  );
-
-  const startCountdown = useCallback(() => {
-    cancelCountdown();
-    setCountdown(3);
-    countdownTimerRef.current = setInterval(() => {
-      setCountdown((prev) => {
-        if (prev === null) return null;
-        if (prev <= 1) {
-          cancelCountdown();
-          performCapture('auto');
-          return null;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-  }, [cancelCountdown, performCapture]);
-
-  // Scoring + guidance.
+  // Scoring + guidance + displaySuccess (same as image-recognition)
   useEffect(() => {
     const rawScore = computeMatchScore(templatePose, livePose, templateImageSize);
     const smoothedScore = getSmoothedScore(rawScore);
     setMatchScore(smoothedScore);
-    if (smoothedScore < GUIDANCE_MAX_MATCH && livePose) {
-      setGuidancePrompt(getGuidancePrompt(livePose));
-    } else {
+    if (smoothedScore >= SUCCESS_THRESHOLD) {
+      successHoldCountRef.current += 1;
+      if (successHoldCountRef.current >= SUCCESS_HOLD_FRAMES) {
+        setDisplaySuccess(true);
+      }
       setGuidancePrompt(null);
+    } else {
+      successHoldCountRef.current = 0;
+      setDisplaySuccess(false);
+      if (smoothedScore < GUIDANCE_MAX_MATCH && livePose) {
+        setGuidancePrompt(getGuidancePrompt(livePose));
+      } else {
+        setGuidancePrompt(null);
+      }
     }
   }, [templatePose, livePose, templateImageSize, getSmoothedScore]);
-
-  // Auto-capture logic (80%+ for 3s then countdown).
-  useEffect(() => {
-    if (!autoCaptureEnabled) {
-      autoHoldStartRef.current = null;
-      cancelCountdown();
-      return;
-    }
-    if (matchScore >= 80) {
-      if (!autoHoldStartRef.current) autoHoldStartRef.current = performance.now();
-      const elapsed = performance.now() - (autoHoldStartRef.current ?? 0);
-      if (elapsed >= 3000 && countdown === null && !isCapturingRef.current) {
-        startCountdown();
-      }
-    } else {
-      autoHoldStartRef.current = null;
-      cancelCountdown();
-    }
-  }, [matchScore, autoCaptureEnabled, countdown, startCountdown, cancelCountdown]);
 
   // Start webcam when entering camera step (works for both deep link and manual).
   useEffect(() => {
@@ -736,57 +675,14 @@ function CameraPageContent() {
     setStep('camera');
   }, [templatePose]);
 
-  const handleResetCapture = useCallback(() => {
-    hasCapturedRef.current = false;
-    isCapturingRef.current = false;
-    cancelCountdown();
-    setShowSuccessModal(false);
-    setCapturedPhoto(null);
-    previousScoreRef.current = 0;
-    setMatchScore(0);
-    setLastCaptureType(null);
-    setSaveInFlight(false);
-    pendingPoseNameRef.current = null;
-    pendingScoreRef.current = null;
-    pendingCaptureTypeRef.current = null;
-    modeRef.current = 'template';
-  }, [cancelCountdown]);
-
   const handleBack = useCallback(() => {
-    console.log('Back button clicked, current step:', step);
-    handleResetCapture();
     modeRef.current = 'template';
     if (step === 'camera') {
       setStep('upload');
     } else {
       router.push('/');
     }
-  }, [handleResetCapture, step, router]);
-
-  const handleSaveConfirmed = useCallback(async () => {
-    if (!capturedPhoto || !pendingPoseNameRef.current || pendingScoreRef.current === null || !pendingCaptureTypeRef.current) {
-      handleResetCapture();
-      return;
-    }
-    setSaveInFlight(true);
-    try {
-      await saveGalleryPhoto({
-        poseName: pendingPoseNameRef.current,
-        photoDataUrl: capturedPhoto,
-        score: pendingScoreRef.current,
-        captureType: pendingCaptureTypeRef.current,
-      });
-    } catch {
-      // ignore save errors for now
-    }
-    setSaveInFlight(false);
-    setShowSuccessModal(false);
-    // keep the photo shown briefly then reset to allow new shot
-    handleResetCapture();
-  }, [capturedPhoto, handleResetCapture]);
-
-  // Determine pose name for display
-  const currentPoseName = poseNameOverride ?? 'Custom Pose';
+  }, [step, router]);
 
   return (
     <div
@@ -898,39 +794,23 @@ function CameraPageContent() {
                 <span className="text-[15px] font-semibold tabular-nums text-white/95 min-w-[2.25rem]">
                   {matchScore}%
                 </span>
-                {matchScore >= SUCCESS_THRESHOLD && (
+                {displaySuccess && (
                   <span className="text-[11px] font-medium text-emerald-400/80 tracking-wide">
                     success
                   </span>
                 )}
-                <span className={autoCaptureEnabled ? 'text-white/70' : 'text-white/40'} title="Auto-capture">Auto</span>
-                <button
-                  onClick={() => setAutoCaptureEnabled((v) => !v)}
-                  className={`w-10 h-5 rounded-full border border-white/20 relative transition-colors ${autoCaptureEnabled ? 'bg-green-600' : 'bg-white/10'}`}
-                >
-                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${autoCaptureEnabled ? 'translate-x-5' : 'translate-x-0.5'}`} />
-                </button>
               </div>
               <div className="w-14" />
             </div>
 
             {/* Guidance pill — above bottom bar */}
-            {guidancePrompt && !showSuccessModal && (
+            {guidancePrompt && (
               <div
                 className="absolute left-0 right-0 flex justify-center pointer-events-none"
                 style={{ bottom: 'max(4.5rem, calc(env(safe-area-inset-bottom) + 4rem))' }}
               >
                 <span className="px-4 py-2 rounded-full bg-black/45 backdrop-blur-sm text-white/90 text-[13px] font-medium border border-white/[0.06]">
                   {guidancePrompt}
-                </span>
-              </div>
-            )}
-
-            {/* Countdown overlay */}
-            {countdown !== null && (
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <span className="text-7xl font-black text-white drop-shadow-lg">
-                  {countdown}
                 </span>
               </div>
             )}
@@ -972,56 +852,19 @@ function CameraPageContent() {
                   )}
                 </div>
               )}
-              {!showSuccessModal && (
-                <button
-                  type="button"
-                  onClick={() => performCapture('manual')}
-                  className="px-5 py-2.5 rounded-full bg-white text-[#1a1a1b] font-semibold text-[13px] shadow-lg active:scale-[0.98] transition-transform shrink-0 hover:bg-white/95"
-                >
-                  Take picture
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={capturePhoto}
+                className="px-5 py-2.5 rounded-full bg-white text-[#1a1a1b] font-semibold text-[13px] shadow-lg active:scale-[0.98] transition-transform shrink-0 hover:bg-white/95"
+              >
+                Take picture
+              </button>
             </div>
 
             {/* Camera error */}
             {camError && (
               <div className="absolute inset-0 flex items-center justify-center bg-[#1a1a1b]/90 backdrop-blur-sm p-4 text-center text-[13px] text-white/90">
                 {camError}
-              </div>
-            )}
-
-            {/* Success modal with captured photo */}
-            {showSuccessModal && capturedPhoto && (
-              <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-                <div className="bg-zinc-900 border border-white/15 rounded-2xl p-5 max-w-sm w-full flex flex-col items-center gap-4">
-                  <div className="w-12 h-12 rounded-full bg-green-500/20 flex items-center justify-center">
-                    <span className="text-2xl">&#10003;</span>
-                  </div>
-                  <h2 className="text-xl font-bold text-white">Nailed it!</h2>
-                  <img
-                    src={capturedPhoto}
-                    alt="Captured pose"
-                    className="w-full rounded-xl aspect-[3/4] object-cover"
-                  />
-                  <p className="text-sm text-white/60">
-                    {matchScore}% match &middot; {currentPoseName} &middot; {lastCaptureType ?? 'manual'}
-                  </p>
-                  <div className="flex gap-3 w-full">
-                    <button
-                      onClick={handleSaveConfirmed}
-                      disabled={saveInFlight}
-                      className="flex-1 py-2.5 rounded-xl bg-white text-black text-center text-sm font-semibold hover:bg-white/90 transition-colors disabled:opacity-60"
-                    >
-                      {saveInFlight ? 'Saving…' : 'Save to Gallery'}
-                    </button>
-                    <button
-                      onClick={handleResetCapture}
-                      className="flex-1 py-2.5 rounded-xl bg-white/10 border border-white/15 text-center text-sm font-medium hover:bg-white/15 transition-colors"
-                    >
-                      Try Again
-                    </button>
-                  </div>
-                </div>
               </div>
             )}
           </main>
