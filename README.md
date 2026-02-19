@@ -13,11 +13,12 @@ npm install
 ```
 
 ### Environment
-Create `.env.local` at repo root:
-```
-NEXT_PUBLIC_SUPABASE_URL=your-supabase-url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
-```
+See **[SETUP-DEV.md](./SETUP-DEV.md)** for step-by-step API/env setup. Quick version:
+
+1. Copy `.env.example` → `.env.local`
+2. In [Supabase](https://supabase.com) → your project → **Settings → API**, copy **Project URL** and **anon public** key into `.env.local`:
+   - `NEXT_PUBLIC_SUPABASE_URL=<Project URL>`
+   - `NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon key>`
 
 ### Supabase setup (SQL)
 Run in Supabase SQL editor:
@@ -57,6 +58,9 @@ create policy "delete gallery" on gallery_photos for delete using (auth.uid() = 
 npm run dev
 ```
 Open http://localhost:3000. Browser will ask for camera permission on the camera page.
+
+### Deploy (Vercel)
+See **[DEPLOY.md](./DEPLOY.md)**. Quick: add the same env vars in Vercel → Settings → Environment Variables, then run `npm run deploy` to push updates to production.
 
 ### Notes
 - Auth: Supabase email/password via `/login`. Middleware protects `/camera`, `/saved`, `/gallery` when env keys are set.
