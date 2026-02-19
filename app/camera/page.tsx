@@ -208,6 +208,7 @@ function CameraPageContent() {
   const [guidancePrompt, setGuidancePrompt] = useState<string | null>(null);
   const [displaySuccess, setDisplaySuccess] = useState(false);
   const [poseNameOverride, setPoseNameOverride] = useState<string | null>(null);
+  const [capturedPhotoDataUrl, setCapturedPhotoDataUrl] = useState<string | null>(null);
 
   const successHoldCountRef = useRef(0);
   const poseRef = useRef<InstanceType<typeof import('@mediapipe/pose').Pose> | null>(null);
@@ -432,7 +433,7 @@ function CameraPageContent() {
     };
   }, [isCamActive, draw]);
 
-  /** Capture raw video frame (no overlay) — share or download, same as image-recognition. */
+  /** Capture raw video frame and show comparison overlay. */
   const capturePhoto = useCallback(() => {
     const video = videoRef.current;
     if (!video || video.readyState < 2) return;
@@ -444,9 +445,15 @@ function CameraPageContent() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     ctx.drawImage(video, 0, 0, w, h);
-    canvas.toBlob(
-      (blob) => {
-        if (!blob) return;
+    const dataUrl = canvas.toDataURL('image/png');
+    setCapturedPhotoDataUrl(dataUrl);
+  }, []);
+
+  const handleAcceptPhoto = useCallback(() => {
+    if (!capturedPhotoDataUrl) return;
+    fetch(capturedPhotoDataUrl)
+      .then((res) => res.blob())
+      .then((blob) => {
         const file = new File([blob], `pose-capture-${Date.now()}.png`, { type: 'image/png' });
         if (typeof navigator !== 'undefined' && navigator.share && navigator.canShare?.({ files: [file] })) {
           navigator.share({ files: [file], title: 'Pose capture' }).catch(() => {
@@ -455,9 +462,12 @@ function CameraPageContent() {
         } else {
           downloadBlob(blob);
         }
-      },
-      'image/png'
-    );
+      });
+    setCapturedPhotoDataUrl(null);
+  }, [capturedPhotoDataUrl]);
+
+  const handleRetakePhoto = useCallback(() => {
+    setCapturedPhotoDataUrl(null);
   }, []);
 
   function downloadBlob(blob: Blob) {
@@ -821,6 +831,65 @@ function CameraPageContent() {
             {camError && (
               <div className="absolute inset-0 flex items-center justify-center bg-[#1a1a1b]/90 backdrop-blur-sm p-4 text-center text-[13px] text-white/90">
                 {camError}
+              </div>
+            )}
+
+            {/* Post-capture comparison: side-by-side (desktop) or stacked (mobile), scroll to compare */}
+            {capturedPhotoDataUrl && (
+              <div
+                className="absolute inset-0 z-50 flex flex-col bg-[#1a1a1b] overflow-auto"
+                style={{ paddingTop: 'max(0.5rem, env(safe-area-inset-top))', paddingBottom: 'max(5rem, calc(env(safe-area-inset-bottom) + 5rem))' }}
+              >
+                <div className="flex-none px-3 py-2 text-center">
+                  <p className="text-[13px] text-white/80">Compare your shot with the reference</p>
+                  <p className="text-[11px] text-white/50 mt-0.5">Scroll down to see both · Accept or Retake</p>
+                </div>
+                <div className="flex-1 min-h-0 flex flex-col md:flex-row gap-4 p-4 md:p-6">
+                  {/* Reference (template) */}
+                  <div className="flex-1 min-w-0 flex flex-col items-center gap-2">
+                    <span className="text-[11px] font-medium text-white/60 uppercase tracking-wider">Reference</span>
+                    {templateImageUrl ? (
+                      <img
+                        src={templateImageUrl}
+                        alt="Reference pose"
+                        className="w-full max-w-sm aspect-[3/4] object-contain rounded-xl border border-white/10 bg-black/30"
+                      />
+                    ) : (
+                      <div className="w-full max-w-sm aspect-[3/4] rounded-xl border border-white/10 bg-black/30 flex items-center justify-center text-white/40 text-sm">
+                        No reference
+                      </div>
+                    )}
+                  </div>
+                  {/* Your capture */}
+                  <div className="flex-1 min-w-0 flex flex-col items-center gap-2">
+                    <span className="text-[11px] font-medium text-white/60 uppercase tracking-wider">Your shot</span>
+                    <img
+                      src={capturedPhotoDataUrl}
+                      alt="Your capture"
+                      className="w-full max-w-sm aspect-[3/4] object-contain rounded-xl border border-white/10 bg-black/30"
+                    />
+                    <p className="text-[12px] text-white/70">{matchScore}% match</p>
+                  </div>
+                </div>
+                <div
+                  className="flex-none flex items-center justify-center gap-3 px-4 py-4 border-t border-white/[0.06] bg-black/40"
+                  style={{ paddingBottom: 'max(1rem, env(safe-area-inset-bottom))' }}
+                >
+                  <button
+                    type="button"
+                    onClick={handleRetakePhoto}
+                    className="px-5 py-2.5 rounded-full bg-white/10 border border-white/20 text-white font-semibold text-[13px] hover:bg-white/15 transition-colors"
+                  >
+                    Retake
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleAcceptPhoto}
+                    className="px-5 py-2.5 rounded-full bg-white text-[#1a1a1b] font-semibold text-[13px] shadow-lg hover:bg-white/95 transition-colors"
+                  >
+                    Accept & share
+                  </button>
+                </div>
               </div>
             )}
           </main>
