@@ -29,7 +29,10 @@ function LoginContent() {
       if (error) {
         setError(error.message);
       } else {
-        setMessage('Check your email for a confirmation link!');
+        // Email confirmation is disabled; route straight to intended page.
+        router.push(next);
+        router.refresh();
+        return;
       }
     } else {
       const { error } = await supabase.auth.signInWithPassword({ email, password });

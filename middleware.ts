@@ -41,8 +41,8 @@ export async function middleware(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
-  // Protected routes: /camera and /saved require login
-  const protectedPaths = ['/camera', '/saved'];
+  // Protected routes: camera, saved, gallery require login
+  const protectedPaths = ['/camera', '/saved', '/gallery'];
   const isProtected = protectedPaths.some((p) =>
     request.nextUrl.pathname.startsWith(p)
   );

@@ -1,23 +1,37 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { fetchPhotos, deletePhotoRemote, supabaseConfigured, type SavedPhoto } from '@/lib/storage';
+import { createClient } from '@/lib/supabase';
 import Link from 'next/link';
 
 export default function SavedPage() {
   const [photos, setPhotos] = useState<SavedPhoto[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const router = useRouter();
 
   useEffect(() => {
     (async () => {
+      const supabase = createClient();
+      const { data } = await supabase.auth.getUser();
+      if (!data.user) {
+        router.push('/login?next=/saved');
+        return;
+      }
       try {
         const data = await fetchPhotos();
         setPhotos(data);
+        setError(null);
       } catch (err) {
         console.error(err);
+        setError('Could not load saved photos.');
         setPhotos([]);
       }
+      setLoading(false);
     })();
-  }, []);
+  }, [router]);
 
   const handleDelete = (id: string) => {
     deletePhotoRemote(id).then(() => {
@@ -35,7 +49,18 @@ export default function SavedPage() {
         </p>
       </header>
 
-      {photos.length === 0 ? (
+      {loading ? (
+        <div className="flex flex-col items-center justify-center px-4 pt-32 text-center">
+          <div className="w-6 h-6 border-2 border-white/30 border-t-white rounded-full animate-spin mb-3" />
+          <p className="text-white/60 text-sm">Loading your saved poses...</p>
+        </div>
+      ) : error ? (
+        <div className="flex flex-col items-center justify-center px-4 pt-32 text-center">
+          <span className="text-6xl mb-4">⚠️</span>
+          <p className="text-sm text-white/60">{error}</p>
+          {!supabaseConfigured && <p className="text-xs text-white/40 mt-2">Supabase env vars missing</p>}
+        </div>
+      ) : photos.length === 0 ? (
         <div className="flex flex-col items-center justify-center px-4 pt-32 text-center">
           <span className="text-6xl mb-4">📷</span>
           <h2 className="text-xl font-semibold mb-2">No saved photos yet</h2>

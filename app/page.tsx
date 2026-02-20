@@ -1,12 +1,19 @@
 'use client';
 
-import { useMemo, useState, useTransition } from 'react';
+import { useEffect, useMemo, useState, useTransition } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { Search, Bookmark, Target, MoreVertical } from 'lucide-react';
 import { savePhotoRemote } from '@/lib/storage';
 import { POSE_TEMPLATES, type PoseTemplate } from '@/lib/poses';
+import { createClient } from '@/lib/supabase';
+import LoginRequiredModal from '@/components/LoginRequiredModal';
 
 type DetailState = { open: boolean; pose: PoseTemplate | null };
+type PendingAction =
+  | { type: 'save'; pose: PoseTemplate }
+  | { type: 'shoot'; pose: PoseTemplate }
+  | null;
 
 export default function BrowsePage() {
   const [activeCategory, setActiveCategory] = useState<string>('All');
@@ -16,6 +23,10 @@ export default function BrowsePage() {
   const [searchTerm, setSearchTerm] = useState('');
   const [activeOverlayId, setActiveOverlayId] = useState<string | null>(null);
   const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
+  const [showLoginModal, setShowLoginModal] = useState(false);
+
+  const router = useRouter();
+  const supabase = createClient();
 
   const categories = useMemo(
     () => ['All', ...Array.from(new Set(POSE_TEMPLATES.map((p) => p.category)))],
@@ -33,13 +44,52 @@ export default function BrowsePage() {
 
   const recommended = POSE_TEMPLATES.slice(0, 6);
 
-  const handleSave = (pose: PoseTemplate) => {
+  // After returning from login, replay the intended action (saved in sessionStorage)
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      const isAuthed = Boolean(data.user);
+      if (!isAuthed) return;
+      const stored = typeof window !== 'undefined' ? sessionStorage.getItem('postLoginAction') : null;
+      if (stored) {
+        sessionStorage.removeItem('postLoginAction');
+        try {
+          const parsed = JSON.parse(stored) as PendingAction;
+          if (parsed?.type === 'save') {
+            handleSave(parsed.pose, false);
+          } else if (parsed?.type === 'shoot') {
+            handleShoot(parsed.pose, false);
+          }
+        } catch (_) {
+          /* ignore */
+        }
+      }
+    });
+  }, []);
+
+  async function ensureAuthed(desired: PendingAction) {
+    const { data } = await supabase.auth.getUser();
+    if (!data.user) {
+      if (typeof window !== 'undefined') {
+        sessionStorage.setItem('postLoginAction', JSON.stringify(desired));
+      }
+      setShowLoginModal(true);
+      return null;
+    }
+    return data.user;
+  }
+
+  const handleSave = (pose: PoseTemplate, checkAuth = true) => {
     setSaveMessage(null);
     startSaving(async () => {
       try {
+        if (checkAuth) {
+          const user = await ensureAuthed({ type: 'save', pose });
+          if (!user) return;
+        }
+        const base64 = await fetchAsDataUrl(pose.imageUrl);
         await savePhotoRemote({
           poseName: pose.name,
-          photoDataUrl: pose.imageUrl,
+          photoDataUrl: base64,
           score: 0,
         });
         setSavedIds((prev) => {
@@ -53,6 +103,24 @@ export default function BrowsePage() {
       }
       setTimeout(() => setSaveMessage(null), 2500);
     });
+  };
+
+  const handleShoot = async (pose: PoseTemplate, checkAuth = true) => {
+    if (checkAuth) {
+      const user = await ensureAuthed({ type: 'shoot', pose });
+      if (!user) return;
+    }
+    if (typeof window !== 'undefined') {
+      sessionStorage.setItem(
+        'selectedPose',
+        JSON.stringify({
+          id: pose.id,
+          name: pose.name,
+          imageUrl: pose.imageUrl,
+        })
+      );
+      window.location.href = '/camera';
+    }
   };
 
   return (
@@ -167,17 +235,8 @@ export default function BrowsePage() {
                     className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-white text-black text-xs font-semibold"
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (typeof window !== 'undefined') {
-                        sessionStorage.setItem(
-                          'selectedPose',
-                          JSON.stringify({
-                            id: pose.id,
-                            name: pose.name,
-                            imageUrl: pose.imageUrl,
-                          })
-                        );
-                        window.location.href = '/camera';
-                      }
+                      handleShoot(pose);
+                      setActiveOverlayId(null);
                     }}
                   >
                     <Target size={18} />
@@ -220,17 +279,7 @@ export default function BrowsePage() {
                 href="/camera"
                 onClick={(e) => {
                   e.preventDefault();
-                  if (typeof window !== 'undefined') {
-                    sessionStorage.setItem(
-                      'selectedPose',
-                      JSON.stringify({
-                        id: detail.pose!.id,
-                        name: detail.pose!.name,
-                        imageUrl: detail.pose!.imageUrl,
-                      })
-                    );
-                    window.location.href = '/camera';
-                  }
+                  handleShoot(detail.pose!);
                 }}
                 className="w-full text-center py-3 rounded-xl bg-white text-black font-semibold text-sm"
               >
@@ -256,6 +305,23 @@ export default function BrowsePage() {
           </span>
         </div>
       )}
+
+      <LoginRequiredModal
+        open={showLoginModal}
+        onClose={() => setShowLoginModal(false)}
+        next="/"
+        message="Please log in to save poses or shoot."
+      />
     </div>
   );
+}
+
+async function fetchAsDataUrl(url: string): Promise<string> {
+  const res = await fetch(url);
+  const blob = await res.blob();
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.readAsDataURL(blob);
+  });
 }

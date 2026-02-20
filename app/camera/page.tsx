@@ -9,6 +9,9 @@
 import { useCallback, useEffect, useRef, useState, Suspense } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
+import { createClient } from '@/lib/supabase';
+import { saveGalleryPhoto } from '@/lib/storage';
+import LoginRequiredModal from '@/components/LoginRequiredModal';
 
 // ---- Types (MediaPipe landmarks are normalized 0–1) ----
 type Landmark = { x: number; y: number; z?: number; visibility?: number };
@@ -209,6 +212,8 @@ function CameraPageContent() {
   const [displaySuccess, setDisplaySuccess] = useState(false);
   const [poseNameOverride, setPoseNameOverride] = useState<string | null>(null);
   const [capturedPhotoDataUrl, setCapturedPhotoDataUrl] = useState<string | null>(null);
+  const [saveToast, setSaveToast] = useState<string | null>(null);
+  const [showLoginModal, setShowLoginModal] = useState(false);
 
   const successHoldCountRef = useRef(0);
   const poseRef = useRef<InstanceType<typeof import('@mediapipe/pose').Pose> | null>(null);
@@ -229,6 +234,7 @@ function CameraPageContent() {
   } | null>(null);
   const previousScoreRef = useRef(0);
   const poseInitializedRef = useRef(false);
+  const supabase = useRef(createClient());
 
 
   /** EMA (alpha=0.2) over raw score for stable display. */
@@ -449,6 +455,20 @@ function CameraPageContent() {
     setCapturedPhotoDataUrl(dataUrl);
   }, []);
 
+  const captureFrameDataUrl = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || video.readyState < 2) return null;
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.drawImage(video, 0, 0, w, h);
+    return canvas.toDataURL('image/jpeg', 0.9);
+  }, []);
+
   const handleAcceptPhoto = useCallback(() => {
     if (!capturedPhotoDataUrl) return;
     fetch(capturedPhotoDataUrl)
@@ -469,6 +489,37 @@ function CameraPageContent() {
   const handleRetakePhoto = useCallback(() => {
     setCapturedPhotoDataUrl(null);
   }, []);
+
+  const ensureUser = useCallback(async () => {
+    const { data } = await supabase.current.auth.getUser();
+    if (!data.user) {
+      setShowLoginModal(true);
+      return null;
+    }
+    return data.user;
+  }, []);
+
+  const handleSaveToGallery = useCallback(async () => {
+    const user = await ensureUser();
+    if (!user) return;
+    const photoData = capturedPhotoDataUrl ?? captureFrameDataUrl();
+    if (!photoData) {
+      setSaveToast('No frame to save');
+      return;
+    }
+    try {
+      await saveGalleryPhoto({
+        poseName: poseNameOverride ?? 'Pose',
+        photoDataUrl: photoData,
+        score: matchScore,
+        captureType: 'manual',
+      });
+      setSaveToast('Saved to Gallery');
+    } catch (err) {
+      console.error(err);
+      setSaveToast('Save failed');
+    }
+  }, [ensureUser, capturedPhotoDataUrl, captureFrameDataUrl, poseNameOverride, matchScore]);
 
   function downloadBlob(blob: Blob) {
     const url = URL.createObjectURL(blob);
@@ -501,6 +552,12 @@ function CameraPageContent() {
     }
   }, [templatePose, livePose, templateImageSize, getSmoothedScore]);
 
+  useEffect(() => {
+    if (!saveToast) return;
+    const t = setTimeout(() => setSaveToast(null), 2000);
+    return () => clearTimeout(t);
+  }, [saveToast]);
+
   // Start webcam when entering camera step — exact same flow as image-recognition
   useEffect(() => {
     if (step !== 'camera') return;
@@ -512,11 +569,6 @@ function CameraPageContent() {
       const { Camera } = await import('@mediapipe/camera_utils');
       if (cancelled || !poseRef.current) return;
       const pose = poseRef.current;
-      pose.onResults((results: import('@mediapipe/pose').Results) => {
-        if (cancelled) return;
-        const landmarks = results.poseLandmarks ?? null;
-        setLivePose(landmarks ? [...landmarks] : null);
-      });
 
       const startCamera = async (w: number, h: number) => {
         const cam = new Camera(video, {
@@ -766,7 +818,17 @@ function CameraPageContent() {
                   </span>
                 )}
               </div>
-              <div className="w-14" />
+              <div className="w-24 flex justify-end">
+                {displaySuccess && (
+                  <button
+                    type="button"
+                    onClick={handleSaveToGallery}
+                    className="px-3 py-1.5 rounded-full bg-white text-[#1a1a1b] text-xs font-semibold shadow hover:bg-white/90 transition-colors"
+                  >
+                    Save to Gallery
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* Guidance pill — above bottom bar */}
@@ -884,6 +946,13 @@ function CameraPageContent() {
                   </button>
                   <button
                     type="button"
+                    onClick={handleSaveToGallery}
+                    className="px-5 py-2.5 rounded-full bg-emerald-500 text-white font-semibold text-[13px] shadow-lg hover:bg-emerald-400 transition-colors"
+                  >
+                    Save to Gallery
+                  </button>
+                  <button
+                    type="button"
                     onClick={handleAcceptPhoto}
                     className="px-5 py-2.5 rounded-full bg-white text-[#1a1a1b] font-semibold text-[13px] shadow-lg hover:bg-white/95 transition-colors"
                   >
@@ -895,6 +964,21 @@ function CameraPageContent() {
           </main>
         </>
       )}
+
+      {saveToast && (
+        <div className="fixed bottom-24 inset-x-0 flex justify-center z-50 pointer-events-none">
+          <span className="px-4 py-2 rounded-full bg-white text-black text-sm font-semibold shadow">
+            {saveToast}
+          </span>
+        </div>
+      )}
+
+      <LoginRequiredModal
+        open={showLoginModal}
+        onClose={() => setShowLoginModal(false)}
+        next="/camera"
+        message="Log in to save your capture to Gallery."
+      />
     </div>
   );
 }
